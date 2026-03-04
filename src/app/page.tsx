@@ -32,6 +32,9 @@ import PillModal from "@/components/PillModal";
 import FounderMessage from "@/components/FounderMessage";
 import RabbitCompletion from "@/components/RabbitCompletion";
 import DistrictChooser from "@/components/DistrictChooser";
+import XpBar from "@/components/XpBar";
+import LevelUpToast from "@/components/LevelUpToast";
+import { rankFromLevel, tierFromLevel, levelProgress, xpForLevel } from "@/lib/xp";
 import LoadingScreen, { type LoadingStage } from "@/components/LoadingScreen";
 import MiniMap from "@/components/MiniMap";
 import { getCityCache, setCityCache, clearCityCache } from "@/lib/cityCache";
@@ -371,6 +374,9 @@ function HomeContent() {
   const [username, setUsername] = useState("");
   const failedUsernamesRef = useRef<Map<string, string>>(new Map()); // username -> error code
   const [buildings, setBuildings] = useState<CityBuilding[]>([]);
+  // Keep raw dev records so we can inject new devs and regenerate layout locally
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const rawDevsRef = useRef<any[]>([]);
   const [plazas, setPlazas] = useState<CityPlaza[]>([]);
   const [decorations, setDecorations] = useState<CityDecoration[]>([]);
   const [river, setRiver] = useState<CityRiver | null>(null);
@@ -477,6 +483,9 @@ function HomeContent() {
   // Welcome CTA (shown after intro for non-logged-in users)
   const [welcomeCtaVisible, setWelcomeCtaVisible] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
+
+  // XP level-up toast
+  const [levelUpLevel, setLevelUpLevel] = useState<number | null>(null);
 
   // Fly onboarding
   const [showDailyNudge, setShowDailyNudge] = useState(false);
@@ -990,20 +999,64 @@ function HomeContent() {
   const reloadCity = useCallback(async (bustCache = false) => {
     if (bustCache) clearCityCache();
     const cacheBust = bustCache ? `?_t=${Date.now()}` : "";
-    const res = await fetch(`/api/city${cacheBust}`);
-    if (!res.ok) return null;
-    const data = await res.json();
-    setStats(data.stats);
-    if (data.developers.length === 0) return null;
 
-    const layout = generateCityLayout(data.developers);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let allDevs: any[] = [];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let cityStats: any = null;
+
+    // Try pre-computed snapshot first
+    try {
+      const v = Math.floor(Date.now() / 300_000);
+      const snapshotUrl = `${process.env.NEXT_PUBLIC_SUPABASE_URL}/storage/v1/object/public/city-data/snapshot.json?v=${v}${cacheBust ? `&_t=${Date.now()}` : ""}`;
+      const snapshotRes = await fetch(snapshotUrl);
+      if (snapshotRes.ok) {
+        const snapshot = await snapshotRes.json();
+        allDevs = snapshot.developers;
+        cityStats = snapshot.stats;
+      }
+    } catch { /* fall through to chunked */ }
+
+    // Fallback to chunked API
+    if (allDevs.length === 0) {
+      const cbParam = bustCache ? `&_t=${Date.now()}` : "";
+      const CHUNK = 1000;
+      const res = await fetch(`/api/city?from=0&to=${CHUNK}${cbParam}`);
+      if (!res.ok) return null;
+      const data = await res.json();
+      allDevs = data.developers ?? [];
+      cityStats = data.stats;
+
+      const total = cityStats?.total_developers ?? 0;
+      if (total > CHUNK && allDevs.length > 0) {
+        const promises: Promise<{ developers: typeof data.developers } | null>[] = [];
+        for (let from = CHUNK; from < total; from += CHUNK) {
+          promises.push(
+            fetch(`/api/city?from=${from}&to=${from + CHUNK}${cbParam}`)
+              .then(r => r.ok ? r.json() : null)
+          );
+        }
+        const results = await Promise.all(promises);
+        for (const chunk of results) {
+          if (chunk?.developers?.length) {
+            allDevs = [...allDevs, ...chunk.developers];
+          }
+        }
+      }
+    }
+
+    if (allDevs.length === 0) return null;
+
+    rawDevsRef.current = allDevs;
+    setStats(cityStats);
+    const layout = generateCityLayout(allDevs);
     setBuildings(layout.buildings);
     setPlazas(layout.plazas);
     setDecorations(layout.decorations);
     setRiver(layout.river);
     setBridges(layout.bridges);
     setDistrictZones(layout.districtZones);
-    setCityCache({ ...layout, stats: data.stats });
+    setCityCache({ ...layout, stats: cityStats });
     return layout.buildings;
   }, []);
 
@@ -1058,17 +1111,57 @@ function HomeContent() {
           return;
         }
 
-        // Fetch all city data in a single request
+        // Fetch city data
         setLoadStage("fetching");
         setLoadProgress(10);
 
-        const res = await fetch("/api/city");
-        if (!res.ok) throw new Error("Failed to fetch city data");
-        const data = await res.json();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let allDevs: any[] = [];
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let cityStats: any = null;
 
-        setLoadProgress(40);
+        // Try pre-computed snapshot first (single file from Supabase CDN)
+        try {
+          const v = Math.floor(Date.now() / 300_000); // changes every 5 min, aligned with cron
+          const snapshotUrl = `${process.env.NEXT_PUBLIC_SUPABASE_URL}/storage/v1/object/public/city-data/snapshot.json?v=${v}`;
+          const snapshotRes = await fetch(snapshotUrl);
+          if (snapshotRes.ok) {
+            const snapshot = await snapshotRes.json();
+            allDevs = snapshot.developers;
+            cityStats = snapshot.stats;
+          }
+        } catch { /* fall through to chunked */ }
 
-        if (data.developers.length === 0) {
+        // Fallback to chunked API
+        if (allDevs.length === 0) {
+          const CHUNK = 1000;
+          const res = await fetch(`/api/city?from=0&to=${CHUNK}`);
+          if (!res.ok) throw new Error("Failed to fetch city data");
+          const data = await res.json();
+          allDevs = data.developers ?? [];
+          cityStats = data.stats;
+
+          const total = cityStats?.total_developers ?? 0;
+          if (total > CHUNK && allDevs.length > 0) {
+            const promises: Promise<{ developers: typeof data.developers } | null>[] = [];
+            for (let from = CHUNK; from < total; from += CHUNK) {
+              promises.push(
+                fetch(`/api/city?from=${from}&to=${from + CHUNK}`)
+                  .then((r) => (r.ok ? r.json() : null))
+              );
+            }
+            const results = await Promise.all(promises);
+            for (const chunk of results) {
+              if (chunk?.developers?.length) {
+                allDevs = [...allDevs, ...chunk.developers];
+              }
+            }
+          }
+        }
+
+        setLoadProgress(30);
+
+        if (!allDevs || allDevs.length === 0) {
           setLoadProgress(100);
           setLoadStage("ready");
           return;
@@ -1076,11 +1169,12 @@ function HomeContent() {
 
         // Generate layout
         setLoadStage("generating");
-        setLoadProgress(50);
+        setLoadProgress(45);
         await new Promise((r) => setTimeout(r, 0)); // yield to browser
 
-        setStats(data.stats);
-        const finalLayout = generateCityLayout(data.developers);
+        rawDevsRef.current = allDevs;
+        setStats(cityStats);
+        const finalLayout = generateCityLayout(allDevs);
         setBuildings(finalLayout.buildings);
         setPlazas(finalLayout.plazas);
         setDecorations(finalLayout.decorations);
@@ -1088,11 +1182,11 @@ function HomeContent() {
         setBridges(finalLayout.bridges);
         setDistrictZones(finalLayout.districtZones);
 
-        setLoadProgress(70);
+        setLoadProgress(55);
 
         // Rendering: wait for Canvas to process data (2 rAF + fallback)
         setLoadStage("rendering");
-        setLoadProgress(80);
+        setLoadProgress(65);
 
         await new Promise<void>((resolve) => {
           let resolved = false;
@@ -1107,8 +1201,10 @@ function HomeContent() {
           setTimeout(done, 500);
         });
 
+        setLoadProgress(80);
+
         // Save to cache for return visits
-        setCityCache({ ...finalLayout, stats: data.stats });
+        setCityCache({ ...finalLayout, stats: cityStats });
         setLoadProgress(95);
 
         // Enforce minimum 800ms display time to avoid flash
@@ -1332,10 +1428,36 @@ function HomeContent() {
 
       setFeedback(null);
 
-      // Only reload city if the dev is new — skip the full reload when they already exist
+      // If dev is new, inject into local raw array and regenerate layout instantly
+      // (no need to wait for the snapshot cron to include them)
       let updatedBuildings: CityBuilding[] | null = null;
       if (!existedBefore) {
-        updatedBuildings = await reloadCity(true);
+        const newDev = {
+          ...devData,
+          owned_items: [],
+          achievements: [],
+          loadout: null,
+          custom_color: null,
+          billboard_images: [],
+          active_raid_tag: null,
+          kudos_count: devData.kudos_count ?? 0,
+          visit_count: devData.visit_count ?? 0,
+          app_streak: devData.app_streak ?? 0,
+          raid_xp: devData.raid_xp ?? 0,
+          rabbit_completed: false,
+          xp_total: devData.xp_total ?? 0,
+          xp_level: devData.xp_level ?? 1,
+        };
+        rawDevsRef.current = [...rawDevsRef.current, newDev];
+        const layout = generateCityLayout(rawDevsRef.current);
+        setBuildings(layout.buildings);
+        setPlazas(layout.plazas);
+        setDecorations(layout.decorations);
+        setRiver(layout.river);
+        setBridges(layout.bridges);
+        setDistrictZones(layout.districtZones);
+        setCityCache({ ...layout, stats: stats ?? { total_developers: 0, total_contributions: 0 } });
+        updatedBuildings = layout.buildings;
       }
 
       // Focus camera on the searched building
@@ -1392,7 +1514,7 @@ function HomeContent() {
     } finally {
       setLoading(false);
     }
-  }, [username, buildings, reloadCity]);
+  }, [username, buildings]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -1470,6 +1592,16 @@ if (claimingGift) return;
   // Stable ref so closures (visit useEffect, kudos callback) always use latest
   const trackMissionRef = useRef(trackClientMission);
   trackMissionRef.current = trackClientMission;
+
+  // Detect level-up from check-in XP result
+  useEffect(() => {
+    if (!streakData?.xp || !myBuilding) return;
+    const newLevel = streakData.xp.new_level;
+    const currentLevel = myBuilding.xp_level ?? 1;
+    if (newLevel > currentLevel) {
+      setLevelUpLevel(newLevel);
+    }
+  }, [streakData?.xp, myBuilding]);
 
   // Live users presence
   const { count: liveUsers, status: liveStatus } = useLiveUsers();
@@ -2594,6 +2726,13 @@ if (claimingGift) return;
                         </span>
                       )}
                     </Link>
+                    {myBuilding?.claimed && (
+                      <XpBar
+                        xpTotal={myBuilding.xp_total ?? 0}
+                        xpLevel={myBuilding.xp_level ?? 1}
+                        accent={theme.accent}
+                      />
+                    )}
                     <button
                       onClick={handleSignOut}
                       className="border-[2px] border-border bg-bg/80 px-2 py-1 text-[9px] text-muted backdrop-blur-sm transition-colors hover:text-cream hover:border-border-light"
@@ -2822,6 +2961,47 @@ if (claimingGift) return;
                   )}
                 </div>
               </div>
+
+              {/* XP Level badge + progress */}
+              {(() => {
+                const bTier = tierFromLevel(selectedBuilding.xp_level ?? 1);
+                const bRank = rankFromLevel(selectedBuilding.xp_level ?? 1);
+                const bProgress = levelProgress(selectedBuilding.xp_total ?? 0);
+                const bXpCurrent = (selectedBuilding.xp_total ?? 0) - xpForLevel(selectedBuilding.xp_level ?? 1);
+                const bXpNeeded = xpForLevel((selectedBuilding.xp_level ?? 1) + 1) - xpForLevel(selectedBuilding.xp_level ?? 1);
+                return (
+                  <div className="mx-4 mb-2 flex items-center gap-2">
+                    <span
+                      className="flex h-7 w-7 items-center justify-center border-[2px] text-xs font-bold"
+                      style={{ borderColor: bTier.color, color: bTier.color }}
+                    >
+                      {selectedBuilding.xp_level ?? 1}
+                    </span>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-[10px] font-bold" style={{ color: bTier.color }}>
+                          Lv {selectedBuilding.xp_level ?? 1} · {bRank.title}
+                        </span>
+                        <span
+                          className="px-1 py-px text-[7px] font-bold"
+                          style={{ backgroundColor: bTier.color + "22", color: bTier.color }}
+                        >
+                          {bTier.name.toUpperCase()}
+                        </span>
+                      </div>
+                      <div className="mt-1 flex items-center gap-1.5">
+                        <div className="h-[4px] flex-1 bg-border">
+                          <div
+                            className="h-full"
+                            style={{ width: `${Math.max(2, Math.round(bProgress * 100))}%`, backgroundColor: bTier.color }}
+                          />
+                        </div>
+                        <span className="text-[7px] text-muted">{bXpCurrent}/{bXpNeeded}</span>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
 
               {/* District badge */}
               {selectedBuilding.district && (
@@ -3642,7 +3822,7 @@ if (claimingGift) return;
 
 
       {/* ─── Daily Missions (quest tracker, right side) ─── */}
-      {session && myBuilding?.claimed && !flyMode && !introMode && !rabbitCinematic && (
+      {session && myBuilding?.claimed && !flyMode && !introMode && !exploreMode && !rabbitCinematic && (
         <DailiesWidget
           data={dailiesData}
           accent={theme.accent}
@@ -3677,6 +3857,11 @@ if (claimingGift) return;
             }
           `}</style>
         </div>
+      )}
+
+      {/* ─── Level Up Toast ─── */}
+      {levelUpLevel !== null && (
+        <LevelUpToast level={levelUpLevel} onDone={() => setLevelUpLevel(null)} />
       )}
 
       {/* ─── Activity Ticker ─── */}
